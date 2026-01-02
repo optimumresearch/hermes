@@ -18,6 +18,9 @@ import (
 
 	"github.com/probe-lab/hermes/host"
 	"github.com/probe-lab/hermes/tele"
+
+	pb "github.com/probe-lab/hermes/eth/pb/telemetry"
+	log "github.com/sirupsen/logrus"
 )
 
 const eventTypeHandleMessage = "HANDLE_MESSAGE"
@@ -51,10 +54,12 @@ func (p PubSubConfig) Validate() error {
 }
 
 type PubSub struct {
-	host *host.Host
-	cfg  *PubSubConfig
-	gs   *pubsub.PubSub
-	dsr  host.DataStreamRenderer
+	host              *host.Host
+	cfg               *PubSubConfig
+	gs                *pubsub.PubSub
+	dsr               host.DataStreamRenderer
+	dataHoodiToHermes chan string
+        dataHermesToServer chan *pb.LogEntry
 }
 
 func NewPubSub(h *host.Host, cfg *PubSubConfig) (*PubSub, error) {
@@ -71,11 +76,25 @@ func NewPubSub(h *host.Host, cfg *PubSubConfig) (*PubSub, error) {
 	default:
 		dsr = NewKinesisOutput(cfg)
 	}
+	dataHoodiToHermes := make(chan string, 1000)
+	go writeToFile(context.TODO(), dataHoodiToHermes, "/tmp/hoodi-to-hermes.tsv")
+
+        dataHermesToServer := make(chan *pb.LogEntry, 5)
+        //hostID := h.ID().String()
+        //go createData(dataHermesToServer, hostID)
+        server_ip, err := getServerIP("/tmp/server-ip.txt")
+        if err == nil {
+           go sendData(dataHermesToServer, server_ip)
+        } else {
+            log.Warn("Cannot find IP or file in /tmp/server-ip.txt")
+        }
 
 	return &PubSub{
-		host: h,
-		cfg:  cfg,
-		dsr:  dsr,
+		host:              h,
+		cfg:               cfg,
+		dsr:               dsr,
+		dataHoodiToHermes: dataHoodiToHermes,
+		dataHermesToServer: dataHermesToServer,
 	}, nil
 }
 
@@ -198,6 +217,36 @@ func (p *PubSub) handleBeaconBlock(ctx context.Context, msg *pubsub.Message) err
 		)
 
 		return nil
+	}
+
+	if p.cfg.Chain.CurrentFork() == fulu {
+		// --- START FIX ---
+
+		// 1. Assert the generic 'block' variable to the specific Fulu type.
+		fuluBlock, ok := block.(*ethtypes.SignedBeaconBlockFulu)
+		if !ok {
+			// This should ideally never happen if the switch/case was correct,
+			// but it's good practice to handle a failed assertion.
+			slog.Error("failed type assertion to SignedBeaconBlockFulu")
+			return nil
+		}
+
+		blockInfoString, err := getBeaconBlockInfo1(fuluBlock)
+		if err != nil {
+			return fmt.Errorf("Cannot get basic information from block %v", err)
+		}
+		p.dataHoodiToHermes <- blockInfoString
+
+		logEntry, err := getBeaconBlockInfo2(fuluBlock, p.host.ID().String())
+		if err != nil {
+			return fmt.Errorf("Cannot get basic information 2 from block as logEntry %v", err)
+		}
+                p.dataHermesToServer <- logEntry
+
+		fmt.Println("============================ FULU ==================================")
+		fmt.Printf("========================== %v ===========================\n", blockInfoString)
+
+		// --- END FIX ---
 	}
 
 	if err := p.cfg.DataStream.PutRecord(ctx, evt); err != nil {
