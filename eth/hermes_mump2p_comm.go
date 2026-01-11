@@ -268,127 +268,96 @@ func getBeaconBlockInfo2(fuluBlock *eth.SignedBeaconBlockFulu, hostID string) (*
 
 func receiveMessages(ctx context.Context, ip string, topic string) error {
 	for {
+		// 1. Check context before trying to connect
 		select {
 		case <-ctx.Done():
-			log.Printf("[%s] context canceled, stopping", ip)
 			return ctx.Err()
 		default:
 		}
 
-		streamError := false
-
-		// 1. Connect to the client
-		conn, err := grpc.NewClient(ip,
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithDefaultCallOptions(
-				grpc.MaxCallRecvMsgSize(math.MaxInt),
-				grpc.MaxCallSendMsgSize(math.MaxInt),
-			),
-		)
-
-		log.Warnf("Connecting to %v to receive\n", ip)
-
-		if err != nil {
-			log.Warn("======================failed to connect to local mump2p: %v", err)
-			streamError = true
-			time.Sleep(2 * time.Second) // small delay before moving on
-			continue
-		}
-		defer func() {
-			if err := conn.Close(); err != nil {
-				log.WithError(err).Error("Failed to close the conn")
-			}
-		}()
-
-		client := protobuf.NewCommandStreamClient(conn)
-
-		// 2.  Create stream with context
-		stream, err := client.ListenCommands(ctx)
-		if err != nil {
-			streamError = true
-			time.Sleep(2 * time.Second) // small delay before moving on
-			log.Warnf("======================================failed to create stream to mump2p: %w", err)
-			continue
-		}
-
-		log.Infof("Connected to mump2p node %s to receive\n", ip)
-
-		subReq := &protobuf.Request{
-			Command: int32(CommandSubscribeToTopic),
-			Topic:   topic,
-		}
-		if err := stream.Send(subReq); err != nil {
-			log.WithError(err).Error(fmt.Sprintf("send subscribe: %v", err))
-		}
-		log.Infof("Subscribed to topic %q, waiting for messages…\n", topic)
-
-		recvMsgChan := make(chan *protobuf.Response, 10000)
-
-		// recv goroutine
-		go func() {
-			for {
-				resp, err := stream.Recv()
-				if err == io.EOF {
-					log.Errorf("EOF: Closing stream\n", err)
-					close(recvMsgChan)
-					return
-				}
-				if err != nil {
-					log.WithError(err).Error(fmt.Sprintf("recv error: %v", err))
-					log.Errorf("Error: Closing stream\n", err)
-					close(recvMsgChan)
-					return
-				}
-				recvMsgChan <- resp
-			}
-		}()
-
-		// message handler loop
-		for {
-			select {
-			case <-ctx.Done():
-				log.WithError(fmt.Errorf("Context canceled\n"))
-				return nil
-			case resp, ok := <-recvMsgChan:
-				if !ok {
-					log.WithError(fmt.Errorf("Stream closed\n"))
-					break
-				}
-				//handleResponse(ip, resp, &receivedCount, writeData, dataCh, writeTrace, traceCh)
-
-				switch resp.GetCommand() {
-				case protobuf.ResponseType_Message:
-					var p2pMessage P2PMessage
-					if err := json.Unmarshal(resp.GetData(), &p2pMessage); err != nil {
-						log.WithError(err).Errorf("Error unmarshalling message: %v", err)
-					} else {
-
-						signedBlock, err := unmarshalMumP2PMessageToBlock(p2pMessage.Message)
-						if err != nil {
-							log.Error("Cannot unmarshal data received from Prysm")
-						} else {
-
-							strToWrite, err := getBeaconBlockInfo(signedBlock)
-							if err != nil {
-								log.Error("Cannot get beacon block info")
-							}
-							dataMump2pToHermesCh <- strToWrite
-						}
-					}
-
-					/*
-						hash := sha256.Sum256(p2pMessage.Message)
-						hexHashString := hex.EncodeToString(hash[:])
-
-						fmt.Printf("RECV: %s; publisher: %s; size: %v\n", hexHashString, "Gateway", len(p2pMessage.Message))
-					*/
-				}
-			}
-		}
-
-		if streamError {
-			time.Sleep(2 * time.Second) // small delay before moving on
+		if err := runStream(ctx, ip, topic); err != nil {
+			log.Warnf("Stream failed: %v. Retrying in 2s...", err)
+			time.Sleep(2 * time.Second)
 		}
 	}
-
 }
+
+// Separate function handles the lifecycle of ONE connection
+func runStream(ctx context.Context, ip string, topic string) error {
+	conn, err := grpc.NewClient(ip,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(math.MaxInt),
+			grpc.MaxCallSendMsgSize(math.MaxInt),
+		),
+	)
+	if err != nil {
+		return fmt.Errorf("dial error: %w", err)
+	}
+	defer conn.Close() // Now triggers correctly when runStream returns
+
+	client := protobuf.NewCommandStreamClient(conn)
+	stream, err := client.ListenCommands(ctx)
+	if err != nil {
+		return fmt.Errorf("stream creation failed: %w", err)
+	}
+
+	// Subscribe logic...
+	subReq := &protobuf.Request{Command: int32(CommandSubscribeToTopic), Topic: topic}
+	if err := stream.Send(subReq); err != nil {
+		return fmt.Errorf("subscribe failed: %w", err)
+	}
+
+	// Process messages until an error occurs
+	for {
+		resp, err := stream.Recv()
+		if err != nil {
+			return fmt.Errorf("receive error: %w", err)
+		}
+
+		// Handle your message here directly
+		// (Using a channel is only necessary if handling is slower than receiving)
+		// Pass the response and your destination channel
+		handleMessage(resp, dataMump2pToHermesCh)
+	}
+}
+
+func handleMessage(resp *protobuf.Response, dataOut chan<- string) {
+	// 1. Verify we have the correct response type
+	if resp.GetCommand() != protobuf.ResponseType_Message {
+		return
+	}
+
+	// 2. Unmarshal the outer P2P wrapper
+	var p2pMessage P2PMessage
+	if err := json.Unmarshal(resp.GetData(), &p2pMessage); err != nil {
+		log.WithError(err).Error("Failed to unmarshal outer P2P message")
+		return
+	}
+
+	// 3. Convert the raw P2P data into a Beacon Block
+	signedBlock, err := unmarshalMumP2PMessageToBlock(p2pMessage.Message)
+	if err != nil {
+		log.WithError(err).Error("Cannot unmarshal data received from Prysm")
+		return
+	}
+
+	// 4. Extract specific info (e.g., Slot, Root, or State)
+	strToWrite, err := getBeaconBlockInfo(signedBlock)
+	if err != nil {
+		log.WithError(err).Error("Cannot get beacon block info")
+		return
+	}
+
+	// 5. Send to the processing channel
+	// Note: If the channel is full, this will block.
+	// Use a 'select' with a default if you prefer dropping messages over blocking.
+	dataOut <- strToWrite
+}
+
+/*
+	hash := sha256.Sum256(p2pMessage.Message)
+	hexHashString := hex.EncodeToString(hash[:])
+
+	fmt.Printf("RECV: %s; publisher: %s; size: %v\n", hexHashString, "Gateway", len(p2pMessage.Message))
+*/

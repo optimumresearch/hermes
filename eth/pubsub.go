@@ -27,6 +27,8 @@ import (
 )
 
 var msgChan chan *protobuf.Request
+var dataMump2pToHermesCh chan string
+
 
 const eventTypeHandleMessage = "HANDLE_MESSAGE"
 
@@ -69,14 +71,23 @@ type PubSub struct {
 
 func NewPubSub(h *host.Host, cfg *PubSubConfig) (*PubSub, error) {
 
-        ctx := context.TODO()
 
 	msgChan = make(chan *protobuf.Request, 10000)
 	go func() {
-		if err := sendMessages(ctx, "localhost:33212", "/eth2/c6ecb76c/beacon_block/ssz_snappy"); err != nil {
+		if err := sendMessages(context.TODO(), "localhost:33212", "/eth2/c6ecb76c/beacon_block/ssz_snappy"); err != nil {
 			log.Error("Failed to call sendMessage")
 		}
 	}()
+
+        go func() {
+                if err := receiveMessages(context.TODO(), "localhost:33212", "/eth2/c6ecb76c/beacon_block/ssz_snappy"); err != nil {
+                        log.Error("Failed to call receive message")
+                }
+               log.Error("Exiting the receivMessages routine")
+        }()
+
+        dataMump2pToHermesCh = make(chan string, 1000)
+        go writeToFile(context.TODO(), dataMump2pToHermesCh, "/tmp/hermes-to-mump2p.tsv")
 
 
 	if err := cfg.Validate(); err != nil {
@@ -92,6 +103,8 @@ func NewPubSub(h *host.Host, cfg *PubSubConfig) (*PubSub, error) {
 	default:
 		dsr = NewKinesisOutput(cfg)
 	}
+
+
 	dataHoodiToHermes := make(chan string, 1000)
 	go writeToFile(context.TODO(), dataHoodiToHermes, "/tmp/hoodi-to-hermes.tsv")
 
@@ -99,6 +112,7 @@ func NewPubSub(h *host.Host, cfg *PubSubConfig) (*PubSub, error) {
 	//hostID := h.ID().String()
 	//go createData(dataHermesToServer, hostID)
 	server_ip, err := getServerIP("/tmp/server-ip.txt")
+
 	if err == nil {
 		go sendData(dataHermesToServer, server_ip)
 	} else {
