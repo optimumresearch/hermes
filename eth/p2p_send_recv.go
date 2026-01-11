@@ -8,20 +8,14 @@ import (
 
 	"time"
 
-	pb "github.com/probe-lab/hermes/eth/pb/telemetry"
+ 	pb "github.com/probe-lab/hermes/eth/pb/telemetry"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
 	eth "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	"github.com/gofiber/fiber/v2/log"
 	"google.golang.org/protobuf/proto"
 )
 
-// P2PMessage represents a message structure used in P2P communication
-type P2PMessage struct {
-	MessageID    string // Unique identifier for the message
-	Topic        string // Topic name where the message was published
-	Message      []byte // Actual message data
-	SourceNodeID string // ID of the node that sent the message (we don't need it in future, it is just for debug purposes)
-}
+
 
 func writeToFile(ctx context.Context, dataCh <-chan string, filename string) {
 	file, err := os.Create(filename)

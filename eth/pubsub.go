@@ -16,12 +16,17 @@ import (
 	ssz "github.com/prysmaticlabs/fastssz"
 	"github.com/thejerf/suture/v4"
 
+	"github.com/golang/snappy"
 	"github.com/probe-lab/hermes/host"
 	"github.com/probe-lab/hermes/tele"
 
 	pb "github.com/probe-lab/hermes/eth/pb/telemetry"
 	log "github.com/sirupsen/logrus"
+
+	protobuf "github.com/probe-lab/hermes/eth/pb/protobuf"
 )
+
+var msgChan chan *protobuf.Request
 
 const eventTypeHandleMessage = "HANDLE_MESSAGE"
 
@@ -54,15 +59,26 @@ func (p PubSubConfig) Validate() error {
 }
 
 type PubSub struct {
-	host              *host.Host
-	cfg               *PubSubConfig
-	gs                *pubsub.PubSub
-	dsr               host.DataStreamRenderer
-	dataHoodiToHermes chan string
-        dataHermesToServer chan *pb.LogEntry
+	host               *host.Host
+	cfg                *PubSubConfig
+	gs                 *pubsub.PubSub
+	dsr                host.DataStreamRenderer
+	dataHoodiToHermes  chan string
+	dataHermesToServer chan *pb.LogEntry
 }
 
 func NewPubSub(h *host.Host, cfg *PubSubConfig) (*PubSub, error) {
+
+        ctx := context.TODO()
+
+	msgChan = make(chan *protobuf.Request, 10000)
+	go func() {
+		if err := sendMessages(ctx, "localhost:33212", "/eth2/c6ecb76c/beacon_block/ssz_snappy"); err != nil {
+			log.Error("Failed to call sendMessage")
+		}
+	}()
+
+
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("validate configuration: %w", err)
 	}
@@ -79,21 +95,21 @@ func NewPubSub(h *host.Host, cfg *PubSubConfig) (*PubSub, error) {
 	dataHoodiToHermes := make(chan string, 1000)
 	go writeToFile(context.TODO(), dataHoodiToHermes, "/tmp/hoodi-to-hermes.tsv")
 
-        dataHermesToServer := make(chan *pb.LogEntry, 5)
-        //hostID := h.ID().String()
-        //go createData(dataHermesToServer, hostID)
-        server_ip, err := getServerIP("/tmp/server-ip.txt")
-        if err == nil {
-           go sendData(dataHermesToServer, server_ip)
-        } else {
-            log.Warn("Cannot find IP or file in /tmp/server-ip.txt")
-        }
+	dataHermesToServer := make(chan *pb.LogEntry, 5)
+	//hostID := h.ID().String()
+	//go createData(dataHermesToServer, hostID)
+	server_ip, err := getServerIP("/tmp/server-ip.txt")
+	if err == nil {
+		go sendData(dataHermesToServer, server_ip)
+	} else {
+		log.Warn("Cannot find IP or file in /tmp/server-ip.txt")
+	}
 
 	return &PubSub{
-		host:              h,
-		cfg:               cfg,
-		dsr:               dsr,
-		dataHoodiToHermes: dataHoodiToHermes,
+		host:               h,
+		cfg:                cfg,
+		dsr:                dsr,
+		dataHoodiToHermes:  dataHoodiToHermes,
 		dataHermesToServer: dataHermesToServer,
 	}, nil
 }
@@ -241,10 +257,33 @@ func (p *PubSub) handleBeaconBlock(ctx context.Context, msg *pubsub.Message) err
 		if err != nil {
 			return fmt.Errorf("Cannot get basic information 2 from block as logEntry %v", err)
 		}
-                p.dataHermesToServer <- logEntry
+		p.dataHermesToServer <- logEntry
 
 		fmt.Println("============================ FULU ==================================")
 		fmt.Printf("========================== %v ===========================\n", blockInfoString)
+
+		// 1. Serialize
+		rawBytes, _ := fuluBlock.MarshalSSZ()
+
+		// 2. Compress
+		compressedBytes := snappy.Encode(nil, rawBytes)
+		_ = compressedBytes
+
+		pubReq := &protobuf.Request{
+			Command: int32(CommandPublishData),
+			Topic:   "/eth2/c6ecb76c/beacon_block/ssz_snappy",
+			Data:    compressedBytes,
+		}
+
+		select {
+		case msgChan <- pubReq:
+			log.Warn(fmt.Sprintf("SEND: sending block data of size========================: %d\n", len(compressedBytes)))
+		case <-ctx.Done():
+			return nil
+		}
+
+		// 3. Send
+		//topic.Publish(ctx, compressedBytes)
 
 		// --- END FIX ---
 	}
