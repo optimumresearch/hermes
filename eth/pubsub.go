@@ -28,6 +28,7 @@ import (
 
 var msgChan chan *protobuf.Request
 var dataMump2pToHermesCh chan string
+var dataHermesToServer chan *pb.LogEntry
 
 
 const eventTypeHandleMessage = "HANDLE_MESSAGE"
@@ -71,7 +72,6 @@ type PubSub struct {
 
 func NewPubSub(h *host.Host, cfg *PubSubConfig) (*PubSub, error) {
 
-
 	msgChan = make(chan *protobuf.Request, 10000)
 	go func() {
 		if err := sendMessages(context.TODO(), "localhost:33212", "/eth2/c6ecb76c/beacon_block/ssz_snappy"); err != nil {
@@ -85,9 +85,6 @@ func NewPubSub(h *host.Host, cfg *PubSubConfig) (*PubSub, error) {
                 }
                log.Error("Exiting the receivMessages routine")
         }()
-
-        dataMump2pToHermesCh = make(chan string, 1000)
-        go writeToFile(context.TODO(), dataMump2pToHermesCh, "/tmp/hermes-to-mump2p.tsv")
 
 
 	if err := cfg.Validate(); err != nil {
@@ -104,11 +101,13 @@ func NewPubSub(h *host.Host, cfg *PubSubConfig) (*PubSub, error) {
 		dsr = NewKinesisOutput(cfg)
 	}
 
+        dataMump2pToHermesCh = make(chan string, 1000)
+        go writeToFile(context.TODO(), dataMump2pToHermesCh, "/tmp/mump2p-to-hermes.tsv")
 
 	dataHoodiToHermes := make(chan string, 1000)
 	go writeToFile(context.TODO(), dataHoodiToHermes, "/tmp/hoodi-to-hermes.tsv")
 
-	dataHermesToServer := make(chan *pb.LogEntry, 5)
+	dataHermesToServer = make(chan *pb.LogEntry, 20)
 	//hostID := h.ID().String()
 	//go createData(dataHermesToServer, hostID)
 	server_ip, err := getServerIP("/tmp/server-ip.txt")
@@ -271,17 +270,17 @@ func (p *PubSub) handleBeaconBlock(ctx context.Context, msg *pubsub.Message) err
 		if err != nil {
 			return fmt.Errorf("Cannot get basic information 2 from block as logEntry %v", err)
 		}
+
 		p.dataHermesToServer <- logEntry
 
 		fmt.Println("============================ FULU ==================================")
-		fmt.Printf("========================== %v ===========================\n", blockInfoString)
+		fmt.Printf("========= %v ===========\n", blockInfoString)
 
 		// 1. Serialize
 		rawBytes, _ := fuluBlock.MarshalSSZ()
 
 		// 2. Compress
 		compressedBytes := snappy.Encode(nil, rawBytes)
-		_ = compressedBytes
 
 		pubReq := &protobuf.Request{
 			Command: int32(CommandPublishData),
@@ -291,7 +290,7 @@ func (p *PubSub) handleBeaconBlock(ctx context.Context, msg *pubsub.Message) err
 
 		select {
 		case msgChan <- pubReq:
-			log.Warn(fmt.Sprintf("SEND: sending block data of size========================: %d\n", len(compressedBytes)))
+			log.Warn(fmt.Sprintf("SEND: ==================blocksize: %d\n", len(compressedBytes)))
 		case <-ctx.Done():
 			return nil
 		}

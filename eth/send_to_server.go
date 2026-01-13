@@ -76,7 +76,6 @@ func sendData(dataChan <-chan *pb.LogEntry, serverIP string) {
 				streamError = true
 				break // Handle reconnection logic here
 			}
-			log.Println(logentry.ClientName, "Data pushed to central server")
 		}
 
 		if streamError {

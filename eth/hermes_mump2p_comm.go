@@ -21,6 +21,8 @@ import (
 	protobuf "github.com/probe-lab/hermes/eth/pb/protobuf"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"github.com/golang/snappy"
+	ethtypes "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 )
 
 // P2PMessage represents a message structure used in P2P communication
@@ -218,13 +220,48 @@ func getBeaconBlockInfo(msg proto.Message) (string, error) {
 	return blockInfoString, nil
 }
 
-func unmarshalMumP2PMessageToBlock(binary_data []byte) (*eth.SignedBeaconBlockFulu, error) {
-	newBlock := &eth.SignedBeaconBlockFulu{}
-	if err := proto.Unmarshal(binary_data, newBlock); err != nil {
-		return nil, fmt.Errorf("Failed to unmarshal")
+func getBeaconBlockInfoLogEntry(msg proto.Message) (*pb.LogEntry, error) {
+	signed, err := blocks.NewSignedBeaconBlock(msg)
+	if err != nil {
+		return nil, err
 	}
-	return newBlock, nil
+	if err := blocks.BeaconBlockIsNil(signed); err != nil {
+		return nil, err
+	}
+
+	block := signed.Block()
+	body := block.Body()
+
+	// Try to get execution payload info
+	blockHash := ""
+	blockNumber := uint64(0)
+	blockSize := int(0)
+
+	if executionPayload, err := body.Execution(); err == nil {
+		blockSize = len(executionPayload.ExtraData()) + 32*5 // Basic size estimation
+		blockHash = fmt.Sprintf("%#x", executionPayload.BlockHash())
+		blockNumber = executionPayload.BlockNumber()
+
+		txns, _ := executionPayload.Transactions()
+		for _, tx := range txns {
+			blockSize += len(tx)
+		}
+	}
+
+	timeUnix := time.Now().UnixMilli()
+	logEntry := &pb.LogEntry{
+		Blocknumber: int64(blockNumber),
+		Slot:        int64(block.Slot()),
+		Blockhash:   blockHash,
+		Timestamp:   timeUnix,
+		Blocksize:   int64(blockSize),
+		ClientName:  "host",
+		Type:  "MUMP2P",
+	}
+	
+	return logEntry, nil
 }
+
 
 // gets the basic block information from eth.SignedBeaconBlockFulu, the that comes from the Gossip
 // Parameters:
@@ -262,6 +299,7 @@ func getBeaconBlockInfo2(fuluBlock *eth.SignedBeaconBlockFulu, hostID string) (*
 		Timestamp:   timeUnix,
 		Blocksize:   int64(blockSize),
 		ClientName:  hostID,
+		Type:  "MAINNET",
 	}
 	return logEntry, nil
 }
@@ -330,7 +368,10 @@ func handleMessage(resp *protobuf.Response, dataOut chan<- string) {
 
 	// 2. Unmarshal the outer P2P wrapper
 	var p2pMessage P2PMessage
+	timeUnix := time.Now().UnixMilli()
 	if err := json.Unmarshal(resp.GetData(), &p2pMessage); err != nil {
+	        defaultStringToWrite := fmt.Sprintf("%d\t%d\t%s\t%d\t%d", 1111111, 111111, "0xabcd", timeUnix, 100)
+	        dataOut <- defaultStringToWrite
 		log.WithError(err).Error("Failed to unmarshal outer P2P message")
 		return
 	}
@@ -338,6 +379,9 @@ func handleMessage(resp *protobuf.Response, dataOut chan<- string) {
 	// 3. Convert the raw P2P data into a Beacon Block
 	signedBlock, err := unmarshalMumP2PMessageToBlock(p2pMessage.Message)
 	if err != nil {
+	        defaultStringToWrite := fmt.Sprintf("%d\t%d\t%s\t%d\t%d", 2222222, 2222222, "0xabcd", timeUnix, 100)
+	        dataOut <- defaultStringToWrite
+
 		log.WithError(err).Error("Cannot unmarshal data received from Prysm")
 		return
 	}
@@ -345,6 +389,8 @@ func handleMessage(resp *protobuf.Response, dataOut chan<- string) {
 	// 4. Extract specific info (e.g., Slot, Root, or State)
 	strToWrite, err := getBeaconBlockInfo(signedBlock)
 	if err != nil {
+	        defaultStringToWrite := fmt.Sprintf("%d\t%d\t%s\t%d\t%d", 333333, 3333333, "0xabcd", timeUnix, 100)
+	        dataOut <- defaultStringToWrite
 		log.WithError(err).Error("Cannot get beacon block info")
 		return
 	}
@@ -353,7 +399,37 @@ func handleMessage(resp *protobuf.Response, dataOut chan<- string) {
 	// Note: If the channel is full, this will block.
 	// Use a 'select' with a default if you prefer dropping messages over blocking.
 	dataOut <- strToWrite
+
+        // 6. The LogEntry to send to the server
+        logEntry, err := getBeaconBlockInfoLogEntry(signedBlock)
+	if err != nil {
+		log.Errorf("Cannot get basic information 2 from block as logEntry %v", err)
+	}
+        dataHermesToServer <- logEntry
 }
+
+func unmarshalMumP2PMessageToBlock(data []byte) (*ethtypes.SignedBeaconBlockFulu, error) {
+	// 1. Decompress (Snappy Decode)
+	// snappy.Decode requires a destination buffer or nil to allocate a new one
+	rawBytes, err := snappy.Decode(nil, data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to snappy decode: %w", err)
+	}
+
+	// 2. Initialize an empty Fulu block struct
+	// Note: Use the same version (Fulu) as the sender
+	fuluBlock := new(ethtypes.SignedBeaconBlockFulu)
+
+
+	// 3. Unmarshal (SSZ Decode)
+	// This populates the fuluBlock pointer with the data from rawBytes
+	if err := fuluBlock.UnmarshalSSZ(rawBytes); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal SSZ: %w", err)
+	}
+
+	return fuluBlock, nil
+}
+
 
 /*
 	hash := sha256.Sum256(p2pMessage.Message)
