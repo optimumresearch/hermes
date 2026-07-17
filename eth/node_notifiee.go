@@ -29,7 +29,17 @@ const (
 var _ network.Notifiee = (*Node)(nil)
 
 func (n *Node) Connected(net network.Network, c network.Conn) {
-	slog.Debug("Connected with peer", tele.LogAttrPeerID(c.RemotePeer()), "total", len(n.host.Network().Peers()), "dir", c.Stat().Direction)
+	// Extract IP address from connection
+	peerIP := "unknown"
+	if ip, err := ExtractIPFromMultiaddr(c.RemoteMultiaddr()); err == nil {
+		peerIP = ip
+	}
+
+	slog.Info("Connected with peer",
+		tele.LogAttrPeerID(c.RemotePeer()),
+		"ip", peerIP,
+		"total", len(n.host.Network().Peers()),
+		"dir", c.Stat().Direction)
 
 	if err := n.host.Peerstore().Put(c.RemotePeer(), peerstoreKeyConnectedAt, time.Now()); err != nil {
 		slog.Warn("Failed to store connection timestamp in peerstore", tele.LogAttrError(err))
@@ -148,9 +158,26 @@ func (n *Node) handleNewConnection(pid peer.ID) {
 					slog.Warn("Failed to store handshaked marker in peerstore", tele.LogAttrError(err))
 				}
 
+				// Get peer's IP address and geolocation
+				peerIP := "unknown"
+				geoInfo := "unknown"
+				if addrs := n.host.Peerstore().Addrs(pid); len(addrs) > 0 {
+					if ip, err := ExtractIPFromMultiaddr(addrs[0]); err == nil {
+						peerIP = ip
+						// Lookup geolocation (with timeout)
+						geoCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+						defer cancel()
+						if geo, err := n.geolocator.Lookup(geoCtx, ip); err == nil {
+							geoInfo = geo.String()
+						}
+					}
+				}
+
 				slog.Info(
 					"Performed successful handshake",
 					tele.LogAttrPeerID(pid),
+					"ip", peerIP,
+					"location", geoInfo,
 					"head-slot", strconv.FormatUint(headSlot, 10),
 					"seq", seqNum,
 					"attnets", hex.EncodeToString(attnets),

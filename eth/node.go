@@ -58,6 +58,9 @@ type Node struct {
 	// The discovery service, periodically querying the discv5 DHT network
 	disc *Discovery
 
+	// The geolocation service for tracking peer locations
+	geolocator *GeoLocator
+
 	// MetricTasks
 	connCount     metric.Int64ObservableGauge
 	connDurHist   metric.Float64Histogram
@@ -270,6 +273,7 @@ func NewNode(cfg *NodeConfig) (*Node, error) {
 		pryClient:       pryClient,
 		peerer:          NewPeerer(h, pryClient, cfg.LocalTrustedAddr),
 		disc:            disc,
+		geolocator:      NewGeoLocator(),
 		eventCallbacks:  []func(ctx context.Context, event *host.TraceEvent){},
 	}
 
